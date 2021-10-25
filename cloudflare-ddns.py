@@ -1,14 +1,31 @@
-import requests, json, sys, signal, os, time, threading
+import requests
+import json
+import sys
+import signal
+import os
+import time
+import threading
 
-class GracefulExit:
-  def __init__(self):
-    self.kill_now = threading.Event()
-    signal.signal(signal.SIGINT, self.exit_gracefully)
-    signal.signal(signal.SIGTERM, self.exit_gracefully)
+EXTERNAL_IP_QUERY_APIS = [
+    'https://api.ipify.org',
+    'https://checkip.amazonaws.com',
+    'https://v4.ident.me/',
+    'https://ifconfig.me/ip',
+    'https://ipv4.icanhazip.com/',
+    'http://ipinfo.me'
+]
 
-  def exit_gracefully(self, signum, frame):
-    print("🛑 Stopping main thread...")
-    self.kill_now.set()
+
+class GracefulExit():
+    def __init__(self):
+        self.kill_now = threading.Event()
+        signal.signal(signal.SIGINT, self.exit_gracefully)
+        signal.signal(signal.SIGTERM, self.exit_gracefully)
+
+    def exit_gracefully(self, signum, frame):
+        print("🛑 Stopping main thread...")
+        self.kill_now.set()
+
 
 def deleteEntries(type):
     # Helper function for deleting A or AAAA records
@@ -16,7 +33,8 @@ def deleteEntries(type):
     # existing A or AAAA records are found.
     for option in config["cloudflare"]:
         answer = cf_api(
-            "zones/" + option['zone_id'] + "/dns_records?per_page=100&type=" + type,
+            "zones/" + option['zone_id'] +
+            "/dns_records?per_page=100&type=" + type,
             "GET", option)
     if answer is None or answer["result"] is None:
         time.sleep(5)
@@ -24,29 +42,35 @@ def deleteEntries(type):
     for record in answer["result"]:
         identifier = str(record["id"])
         cf_api(
-            "zones/" + option['zone_id'] + "/dns_records/" + identifier, 
+            "zones/" + option['zone_id'] + "/dns_records/" + identifier,
             "DELETE", option)
         print("🗑️ Deleted stale record " + identifier)
+
 
 def getIPs():
     a = None
     aaaa = None
     global ipv4_enabled
     global ipv6_enabled
+    global purgeUnknownRecords
     if ipv4_enabled:
         try:
-            a = requests.get("https://1.1.1.1/cdn-cgi/trace").text.split("\n")
-            a.pop()
-            a = dict(s.split("=") for s in a)["ip"]
+            #a = requests.get("https://1.1.1.1/cdn-cgi/trace").text.split("\n")
+            #a.pop()
+            #a = dict(s.split("=") for s in a)["ip"]
+            a = requests.get("http://ipinfo.me").text
+            #a = requests.get("http://ipconfig.io").text
         except Exception:
             global shown_ipv4_warning
             if not shown_ipv4_warning:
                 shown_ipv4_warning = True
                 print("🧩 IPv4 not detected")
-            deleteEntries("A")
+            if purgeUnknownRecords:
+                deleteEntries("A")
     if ipv6_enabled:
         try:
-            aaaa = requests.get("https://[2606:4700:4700::1111]/cdn-cgi/trace").text.split("\n")
+            aaaa = requests.get(
+                "https://[2606:4700:4700::1111]/cdn-cgi/trace").text.split("\n")
             aaaa.pop()
             aaaa = dict(s.split("=") for s in aaaa)["ip"]
         except Exception:
@@ -54,7 +78,8 @@ def getIPs():
             if not shown_ipv6_warning:
                 shown_ipv6_warning = True
                 print("🧩 IPv6 not detected")
-            deleteEntries("AAAA")
+            if purgeUnknownRecords:
+                deleteEntries("AAAA")
     ips = {}
     if(a is not None):
         ips["ipv4"] = {
@@ -68,6 +93,7 @@ def getIPs():
         }
     return ips
 
+
 def commitRecord(ip):
     for option in config["cloudflare"]:
         subdomains = option["subdomains"]
@@ -76,7 +102,7 @@ def commitRecord(ip):
             time.sleep(5)
             return
         base_domain_name = response["result"]["name"]
-        ttl = 300 # default Cloudflare TTL
+        ttl = 300  # default Cloudflare TTL
         for subdomain in subdomains:
             subdomain = subdomain.lower().strip()
             record = {
@@ -87,7 +113,8 @@ def commitRecord(ip):
                 "ttl": ttl
             }
             dns_records = cf_api(
-                "zones/" + option['zone_id'] + "/dns_records?per_page=100&type=" + ip["type"], 
+                "zones/" + option['zone_id'] +
+                "/dns_records?per_page=100&type=" + ip["type"],
                 "GET", option)
             fqdn = base_domain_name
             if subdomain:
@@ -99,6 +126,7 @@ def commitRecord(ip):
                 for r in dns_records["result"]:
                     if (r["name"] == fqdn):
                         if identifier:
+
                             if r["content"] == ip["ip"]:
                                 duplicate_ids.append(identifier)
                                 identifier = r["id"]
@@ -112,19 +140,23 @@ def commitRecord(ip):
                 if modified:
                     print("📡 Updating record " + str(record))
                     response = cf_api(
-                        "zones/" + option['zone_id'] + "/dns_records/" + identifier,
+                        "zones/" + option['zone_id'] +
+                        "/dns_records/" + identifier,
                         "PUT", option, {}, record)
             else:
                 print("➕ Adding new record " + str(record))
                 response = cf_api(
                     "zones/" + option['zone_id'] + "/dns_records", "POST", option, {}, record)
-            for identifier in duplicate_ids:
-                identifier = str(identifier)
-                print("🗑️ Deleting stale record " + identifier)
-                response = cf_api(
-                    "zones/" + option['zone_id'] + "/dns_records/" + identifier,
-                    "DELETE", option)
+            if purgeUnknownRecords:
+                for identifier in duplicate_ids:
+                    identifier = str(identifier)
+                    print("🗑️ Deleting stale record " + identifier)
+                    response = cf_api(
+                        "zones/" + option['zone_id'] +
+                        "/dns_records/" + identifier,
+                        "DELETE", option)
     return True
+
 
 def cf_api(endpoint, method, config, headers={}, data=False):
     api_token = config['authentication']['api_token']
@@ -150,13 +182,16 @@ def cf_api(endpoint, method, config, headers={}, data=False):
     if response.ok:
         return response.json()
     else:
-        print("📈 Error sending '" + method + "' request to '" + response.url + "':")
+        print("📈 Error sending '" + method +
+              "' request to '" + response.url + "':")
         print(response.text)
         return None
+
 
 def updateIPs(ips):
     for ip in ips.values():
         commitRecord(ip)
+
 
 if __name__ == '__main__':
     PATH = os.getcwd() + "/"
@@ -165,6 +200,7 @@ if __name__ == '__main__':
     shown_ipv6_warning = False
     ipv4_enabled = True
     ipv6_enabled = True
+    purgeUnknownRecords = False
 
     if(version < 3.5):
         raise Exception("🐍 This script requires Python 3.5+")
@@ -175,7 +211,8 @@ if __name__ == '__main__':
             config = json.loads(config_file.read())
     except:
         print("😡 Error reading config.json")
-        time.sleep(60) # wait 60 seconds to prevent excessive logging on docker auto restart
+        # wait 60 seconds to prevent excessive logging on docker auto restart
+        time.sleep(60)
 
     if config is not None:
         try:
@@ -185,6 +222,11 @@ if __name__ == '__main__':
             ipv4_enabled = True
             ipv6_enabled = True
             print("⚙️ Individually disable IPv4 or IPv6 with new config.json options. Read more about it here: https://github.com/timothymiller/cloudflare-ddns/blob/master/README.md")
+        try:
+            purgeUnknownRecords = config["purgeUnknownRecords"]
+        except:
+            purgeUnknownRecords = False
+            print("⚙️ No config detected for 'purgeUnknownRecords' - defaulting to False")
         if(len(sys.argv) > 1):
             if(sys.argv[1] == "--repeat"):
                 delay = 5*60
@@ -202,6 +244,7 @@ if __name__ == '__main__':
                         break
                     updateIPs(getIPs())
             else:
-                print("❓ Unrecognized parameter '" + sys.argv[1] + "'. Stopping now.")
+                print("❓ Unrecognized parameter '" +
+                      sys.argv[1] + "'. Stopping now.")
         else:
             updateIPs(getIPs())
