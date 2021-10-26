@@ -1,52 +1,38 @@
-import requests, json, sys, signal, os, time, threading
+import json, sys, signal, os, time, threading
+
+import requests
+
 
 class GracefulExit:
-  def __init__(self):
-    self.kill_now = threading.Event()
-    signal.signal(signal.SIGINT, self.exit_gracefully)
-    signal.signal(signal.SIGTERM, self.exit_gracefully)
+    def __init__(self):
+        self.kill_now = threading.Event()
+        signal.signal(signal.SIGINT, self.exit_gracefully)
+        signal.signal(signal.SIGTERM, self.exit_gracefully)
 
-  def exit_gracefully(self, signum, frame):
-    print("🛑 Stopping main thread...")
-    self.kill_now.set()
+    def exit_gracefully(self):
+        print("🛑 Stopping main thread...")
+        self.kill_now.set()
 
-def deleteEntries(type):
-    # Helper function for deleting A or AAAA records
-    # in the case of no IPv4 or IPv6 connection, yet
-    # existing A or AAAA records are found.
-    for option in config["cloudflare"]:
-        answer = cf_api(
-            "zones/" + option['zone_id'] + "/dns_records?per_page=100&type=" + type,
-            "GET", option)
-    if answer is None or answer["result"] is None:
-        time.sleep(5)
-        return
-    for record in answer["result"]:
-        identifier = str(record["id"])
-        cf_api(
-            "zones/" + option['zone_id'] + "/dns_records/" + identifier, 
-            "DELETE", option)
-        print("🗑️ Deleted stale record " + identifier)
 
 def getIPs():
+    # TODO: Use public IP checker from config
+    urlv4 = "https://checkip.amazonaws.com"
+    urlv6 = "https://[2606:4700:4700::1111]/cdn-cgi/trace"
     a = None
     aaaa = None
-    global ipv4_enabled
-    global ipv6_enabled
-    if ipv4_enabled:
+    global IPV4_ENABLED
+    global IPV6_ENABLED
+    if IPV4_ENABLED:
         try:
-            a = requests.get("https://1.1.1.1/cdn-cgi/trace").text.split("\n")
-            a.pop()
-            a = dict(s.split("=") for s in a)["ip"]
+            a = requests.get(urlv4).text
         except Exception:
             global shown_ipv4_warning
             if not shown_ipv4_warning:
                 shown_ipv4_warning = True
                 print("🧩 IPv4 not detected")
-            deleteEntries("A")
-    if ipv6_enabled:
+    if IPV6_ENABLED:
         try:
-            aaaa = requests.get("https://[2606:4700:4700::1111]/cdn-cgi/trace").text.split("\n")
+            aaaa = requests.get(urlv6).text.split("\n")
             aaaa.pop()
             aaaa = dict(s.split("=") for s in aaaa)["ip"]
         except Exception:
@@ -54,7 +40,6 @@ def getIPs():
             if not shown_ipv6_warning:
                 shown_ipv6_warning = True
                 print("🧩 IPv6 not detected")
-            deleteEntries("AAAA")
     ips = {}
     if(a is not None):
         ips["ipv4"] = {
@@ -68,7 +53,8 @@ def getIPs():
         }
     return ips
 
-def commitRecord(ip):
+
+def commit_record(ip):
     for option in config["cloudflare"]:
         subdomains = option["subdomains"]
         response = cf_api("zones/" + option['zone_id'], "GET", option)
@@ -76,7 +62,7 @@ def commitRecord(ip):
             time.sleep(5)
             return
         base_domain_name = response["result"]["name"]
-        ttl = 300 # default Cloudflare TTL
+        ttl = 300  # default Cloudflare TTL
         for subdomain in subdomains:
             subdomain = subdomain.lower().strip()
             record = {
@@ -87,7 +73,8 @@ def commitRecord(ip):
                 "ttl": ttl
             }
             dns_records = cf_api(
-                "zones/" + option['zone_id'] + "/dns_records?per_page=100&type=" + ip["type"], 
+                "zones/" + option['zone_id'] +
+                "/dns_records?per_page=100&type=" + ip["type"],
                 "GET", option)
             fqdn = base_domain_name
             if subdomain:
@@ -106,25 +93,34 @@ def commitRecord(ip):
                                 duplicate_ids.append(r["id"])
                         else:
                             identifier = r["id"]
-                            if r['content'] != record['content'] or r['proxied'] != record['proxied']:
+                            if r['content'] != record['content'] or \
+                                    r['proxied'] != record['proxied']:
                                 modified = True
             if identifier:
                 if modified:
                     print("📡 Updating record " + str(record))
                     response = cf_api(
-                        "zones/" + option['zone_id'] + "/dns_records/" + identifier,
+                        "zones/" + option['zone_id'] +
+                        "/dns_records/" + identifier,
                         "PUT", option, {}, record)
             else:
                 print("➕ Adding new record " + str(record))
                 response = cf_api(
-                    "zones/" + option['zone_id'] + "/dns_records", "POST", option, {}, record)
+                    "zones/" + option['zone_id'] + "/dns_records",
+                    "POST",
+                    option,
+                    {},
+                    record
+                )
             for identifier in duplicate_ids:
                 identifier = str(identifier)
                 print("🗑️ Deleting stale record " + identifier)
                 response = cf_api(
-                    "zones/" + option['zone_id'] + "/dns_records/" + identifier,
+                    "zones/" + option['zone_id'] +
+                    "/dns_records/" + identifier,
                     "DELETE", option)
-    return True
+    return response
+
 
 def cf_api(endpoint, method, config, headers={}, data=False):
     api_token = config['authentication']['api_token']
@@ -135,13 +131,17 @@ def cf_api(endpoint, method, config, headers={}, data=False):
         }
     else:
         headers = {
-            "X-Auth-Email": config['authentication']['api_key']['account_email'],
-            "X-Auth-Key": config['authentication']['api_key']['api_key'],
+            "X-Auth-Email":
+            config['authentication']['api_key']['account_email'],
+            "X-Auth-Key":
+            config['authentication']['api_key']['api_key'],
         }
 
     if(data == False):
         response = requests.request(
-            method, "https://api.cloudflare.com/client/v4/" + endpoint, headers=headers)
+            method, "https://api.cloudflare.com/client/v4/" + endpoint,
+            headers=headers
+        )
     else:
         response = requests.request(
             method, "https://api.cloudflare.com/client/v4/" + endpoint,
@@ -150,58 +150,63 @@ def cf_api(endpoint, method, config, headers={}, data=False):
     if response.ok:
         return response.json()
     else:
-        print("📈 Error sending '" + method + "' request to '" + response.url + "':")
+        print("📈 Error sending '" + method +
+              "' request to '" + response.url + "':")
         print(response.text)
         return None
 
+
 def updateIPs(ips):
     for ip in ips.values():
-        commitRecord(ip)
+        commit_record(ip)
+
 
 if __name__ == '__main__':
     PATH = os.getcwd() + "/"
     version = float(str(sys.version_info[0]) + "." + str(sys.version_info[1]))
     shown_ipv4_warning = False
     shown_ipv6_warning = False
-    ipv4_enabled = True
-    ipv6_enabled = True
+    IPV4_ENABLED = True
+    IPV6_ENABLED = True
 
     if(version < 3.5):
-        raise Exception("🐍 This script requires Python 3.5+")
+        raise RuntimeError("🐍 This script requires Python 3.5+")
 
     config = None
     try:
-        with open(PATH + "config.json") as config_file:
+        with open(PATH + "config.json", encoding="utf8") as config_file:
             config = json.loads(config_file.read())
-    except:
-        print("😡 Error reading config.json")
-        time.sleep(60) # wait 60 seconds to prevent excessive logging on docker auto restart
+    except Exception as e:
+        raise EnvironmentError("😡 Error reading config.json") from e
 
     if config is not None:
         try:
-            ipv4_enabled = config["a"]
-            ipv6_enabled = config["aaaa"]
-        except:
-            ipv4_enabled = True
-            ipv6_enabled = True
-            print("⚙️ Individually disable IPv4 or IPv6 with new config.json options. Read more about it here: https://github.com/timothymiller/cloudflare-ddns/blob/master/README.md")
+            IPV4_ENABLED = config["a"]
+            IPV6_ENABLED = config["aaaa"]
+        except Exception:
+            IPV4_ENABLED = True
+            IPV6_ENABLED = True
+            print("⚙️ Individually disable IPv4 or IPv6 with new config.json \
+            options. Read more about it here: \
+            https://github.com/timothymiller/cloudflare-ddns/blob/master/README.md")
         if(len(sys.argv) > 1):
             if(sys.argv[1] == "--repeat"):
                 delay = 5*60
-                if ipv4_enabled and ipv6_enabled:
-                    print("🕰️ Updating IPv4 (A) & IPv6 (AAAA) records every 5 minutes")
-                elif ipv4_enabled and not ipv6_enabled:
+                if IPV4_ENABLED and IPV6_ENABLED:
+                    print("🕰️ Updating IPv4 (A)& IPv6 (AAAA) records \
+                        every 5 minutes")
+                elif IPV4_ENABLED and not IPV6_ENABLED:
                     print("🕰️ Updating IPv4 (A) records every 5 minutes")
-                elif ipv6_enabled and not ipv4_enabled:
+                elif IPV6_ENABLED and not IPV4_ENABLED:
                     print("🕰️ Updating IPv6 (AAAA) records every 5 minutes")
                 next_time = time.time()
                 killer = GracefulExit()
-                prev_ips = None
                 while True:
                     if killer.kill_now.wait(delay):
                         break
                     updateIPs(getIPs())
             else:
-                print("❓ Unrecognized parameter '" + sys.argv[1] + "'. Stopping now.")
+                print("❓ Unrecognized parameter '" +
+                      sys.argv[1] + "'. Stopping now.")
         else:
             updateIPs(getIPs())
